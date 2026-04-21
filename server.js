@@ -1,115 +1,151 @@
-require('dotenv').config();
+// server.js - Railway OpenAI Proxy Server
+// ═══════════════════════════════════════════════════════════════════
+// 용도: 브라우저 → Railway → OpenAI (CORS 우회)
+// 엔드포인트:
+//   GET  /                → 헬스 체크
+//   POST /openai/chat     → OpenAI Chat Completion 프록시 (대본/대사 생성)
+//   POST /openai/scene    → 사물에 맞는 배경+ambient 동적 생성
+// ═══════════════════════════════════════════════════════════════════
+
 const express = require('express');
 const cors = require('cors');
-const { Pool } = require('pg');
 
 const app = express();
+
+// 모든 도메인 허용 (zhei-la.github.io 등)
 app.use(cors({
   origin: '*',
-  methods: ['GET', 'POST'],
-  allowedHeaders: ['Content-Type']
+  methods: ['GET', 'POST', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization']
 }));
-app.use(express.json());
+app.use(express.json({ limit: '10mb' }));
 
-// DB 연결
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: { rejectUnauthorized: false }
-});
-
-// DB 초기화
-async function initDB() {
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS stats (
-      id SERIAL PRIMARY KEY,
-      type VARCHAR(50),
-      created_at TIMESTAMP DEFAULT NOW()
-    );
-    CREATE TABLE IF NOT EXISTS codes (
-      id SERIAL PRIMARY KEY,
-      code VARCHAR(100) UNIQUE,
-      is_active BOOLEAN DEFAULT true,
-      created_at TIMESTAMP DEFAULT NOW()
-    );
-  `);
-  // 기본 접속 코드 없으면 삽입
-  const existing = await pool.query('SELECT * FROM codes');
-  if (existing.rows.length === 0) {
-    await pool.query(`INSERT INTO codes (code) VALUES ($1)`, [process.env.ACCESS_CODE || 'angry2024']);
-  }
-}
-
-// ── 접속 코드 검증 ──────────────────────────────────────
-app.post('/verify', async (req, res) => {
-  const { code } = req.body;
-  const result = await pool.query(
-    'SELECT * FROM codes WHERE code=$1 AND is_active=true', [code]
-  );
-  if (result.rows.length > 0) {
-    await pool.query(`INSERT INTO stats (type) VALUES ('access')`);
-    res.json({ ok: true });
-  } else {
-    res.json({ ok: false });
-  }
-});
-
-// ── 관리자 인증 ──────────────────────────────────────────
-app.post('/admin/login', (req, res) => {
-  const { password } = req.body;
-  if (password === process.env.ADMIN_PASSWORD) {
-    res.json({ ok: true });
-  } else {
-    res.json({ ok: false });
-  }
-});
-
-// ── 사용 횟수 기록 ───────────────────────────────────────
-app.post('/stats/record', async (req, res) => {
-  const { type } = req.body;
-  await pool.query(`INSERT INTO stats (type) VALUES ($1)`, [type || 'generate']);
-  res.json({ ok: true });
-});
-
-// ── 통계 조회 (관리자) ───────────────────────────────────
-app.post('/admin/stats', async (req, res) => {
-  const { password } = req.body;
-  if (password !== process.env.ADMIN_PASSWORD) return res.json({ ok: false });
-
-  const total = await pool.query(`SELECT COUNT(*) FROM stats WHERE type='access'`);
-  const generates = await pool.query(`SELECT COUNT(*) FROM stats WHERE type='generate'`);
-  const today = await pool.query(`SELECT COUNT(*) FROM stats WHERE type='access' AND created_at >= CURRENT_DATE`);
-  const codes = await pool.query(`SELECT * FROM codes ORDER BY created_at DESC`);
-
-  res.json({
-    ok: true,
-    stats: {
-      totalVisits: total.rows[0].count,
-      todayVisits: today.rows[0].count,
-      totalGenerates: generates.rows[0].count,
-      codes: codes.rows
-    }
+// ═══ 헬스 체크 ═══
+app.get('/', (req, res) => {
+  res.json({ 
+    status: 'OK', 
+    service: 'OpenAI Proxy Server',
+    endpoints: ['/openai/chat', '/openai/scene']
   });
 });
 
-// ── 코드 관리 (관리자) ───────────────────────────────────
-app.post('/admin/codes/add', async (req, res) => {
-  const { password, code } = req.body;
-  if (password !== process.env.ADMIN_PASSWORD) return res.json({ ok: false });
-  await pool.query(`INSERT INTO codes (code) VALUES ($1) ON CONFLICT DO NOTHING`, [code]);
-  res.json({ ok: true });
+// ═══ 1. OpenAI Chat Completion 프록시 ═══
+app.post('/openai/chat', async (req, res) => {
+  try {
+    const { apiKey, system, user, max_tokens, temperature } = req.body;
+
+    if (!apiKey || !apiKey.startsWith('sk-')) {
+      return res.status(400).json({ error: 'Invalid API key (must start with sk-)' });
+    }
+    if (!system || !user) {
+      return res.status(400).json({ error: 'Missing system or user message' });
+    }
+
+    const openaiResponse = await fetch('https://api.openai.com/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': 'Bearer ' + apiKey
+      },
+      body: JSON.stringify({
+        model: 'gpt-4o',
+        max_tokens: max_tokens || 2000,
+        temperature: temperature || 0.95,
+        presence_penalty: 0.3,
+        frequency_penalty: 0.3,
+        messages: [
+          { role: 'system', content: system },
+          { role: 'user', content: user }
+        ]
+      })
+    });
+
+    const data = await openaiResponse.json();
+
+    if (!openaiResponse.ok) {
+      console.error('OpenAI error:', data);
+      return res.status(openaiResponse.status).json({
+        error: (data && data.error && data.error.message) || 'OpenAI API error'
+      });
+    }
+
+    const text = (data && data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content) || '';
+    res.json({ text: text });
+
+  } catch (err) {
+    console.error('[/openai/chat] Proxy error:', err);
+    res.status(500).json({ error: err.message });
+  }
 });
 
-app.post('/admin/codes/toggle', async (req, res) => {
-  const { password, code } = req.body;
-  if (password !== process.env.ADMIN_PASSWORD) return res.json({ ok: false });
-  await pool.query(`UPDATE codes SET is_active = NOT is_active WHERE code=$1`, [code]);
-  res.json({ ok: true });
+// ═══ 2. 사물 맞춤 배경+ambient 동적 생성 ═══
+app.post('/openai/scene', async (req, res) => {
+  try {
+    const { apiKey, object, country, category } = req.body;
+
+    if (!apiKey || !apiKey.startsWith('sk-')) {
+      return res.status(400).json({ error: 'Invalid API key' });
+    }
+    if (!object) {
+      return res.status(400).json({ error: 'Missing object' });
+    }
+
+    const isJP = country === 'jp';
+    const systemPrompt = isJP
+      ? 'You are a cinematic scene designer. Given a personified object, describe its NATIVE HABITAT (where it naturally lives in a real Japanese 1K urban apartment) with realistic, lived-in detail. Output must be natural English suitable for AI image/video prompts. Output JSON ONLY, no explanation.\n\nJSON format:\n{\n  "loc": "short scene location phrase (English, where this object naturally sits in a Japanese apartment)",\n  "props": "3-5 specific contextual items visible around the object in its native habitat, one flowing sentence in English",\n  "ambient": "1-2 subtle ambient motion points (gentle environmental movement that makes the scene feel alive, not cluttered). Examples: steam rising from tea kettle, curtain barely swaying, dust particles in light beams. One sentence in English."\n}'
+      : 'You are a cinematic scene designer. Given a personified object, describe its NATIVE HABITAT (where it naturally lives in a real Korean one-room apartment or office) with realistic, lived-in detail. Output must be natural English suitable for AI image/video prompts. Output JSON ONLY, no explanation.\n\nJSON format:\n{\n  "loc": "short scene location phrase (English, where this object naturally sits in a Korean apartment/office)",\n  "props": "3-5 specific contextual items visible around the object in its native habitat, one flowing sentence in English",\n  "ambient": "1-2 subtle ambient motion points (gentle environmental movement that makes the scene feel alive, not cluttered). Examples: steam rising from the rice cooker vent, curtain barely swaying, dust particles in light beams. One sentence in English."\n}';
+
+    const userPrompt = 'Object: ' + object + (category ? '\nCategory: ' + category : '') + '\n\nGenerate the native habitat scene JSON.';
+
+    const openaiResponse = await fetch('https://api.openai.com/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': 'Bearer ' + apiKey
+      },
+      body: JSON.stringify({
+        model: 'gpt-4o',
+        max_tokens: 500,
+        temperature: 0.8,
+        response_format: { type: 'json_object' },
+        messages: [
+          { role: 'system', content: systemPrompt },
+          { role: 'user', content: userPrompt }
+        ]
+      })
+    });
+
+    const data = await openaiResponse.json();
+
+    if (!openaiResponse.ok) {
+      return res.status(openaiResponse.status).json({
+        error: (data && data.error && data.error.message) || 'OpenAI API error'
+      });
+    }
+
+    const text = (data && data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content) || '{}';
+    let scene;
+    try {
+      scene = JSON.parse(text);
+    } catch (e) {
+      return res.status(500).json({ error: 'Failed to parse scene JSON', raw: text });
+    }
+
+    res.json({
+      loc: scene.loc || (isJP ? 'in a Japanese 1K urban apartment' : 'in a Korean one-room apartment'),
+      props: scene.props || 'contextually relevant items placed naturally around the subject',
+      ambient: scene.ambient || 'subtle ambient life — dust in light, fabric edges faintly moving'
+    });
+
+  } catch (err) {
+    console.error('[/openai/scene] error:', err);
+    res.status(500).json({ error: err.message });
+  }
 });
 
-// ── 헬스체크 ─────────────────────────────────────────────
-app.get('/', (req, res) => res.json({ status: 'ok' }));
-
-const PORT = process.env.PORT || 3000;
-initDB().then(() => {
-  app.listen(PORT, () => console.log(`서버 실행 중: ${PORT}`));
+const PORT = process.env.PORT || 8080;
+app.listen(PORT, () => {
+  console.log('✅ OpenAI Proxy Server running on port ' + PORT);
+  console.log('   Endpoints: GET /, POST /openai/chat, POST /openai/scene');
 });
+
