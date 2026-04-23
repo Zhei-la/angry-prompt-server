@@ -1,6 +1,6 @@
 // ============================================================
-// server.js v2 — 오늘의 참견 / 인스타툰 / 애니메이션 공용 Railway 프록시
-// 추가: 통계 트래킹 시스템 (IP 기반 방문자 + 생성 카운트, JSON 파일 저장)
+// server.js v3 — 안전 강화판
+// Railway 배포 실패 방어: 모든 I/O try-catch, 권한 에러 무시, 메모리 fallback
 // by 제일라 · GitHub: Zhei-la
 // ============================================================
 
@@ -13,20 +13,41 @@ const app = express();
 
 app.use(express.json({ limit: '10mb' }));
 app.use(cors());
-
-// trust proxy (Railway는 프록시 뒤에 있어서 실제 IP 받으려면 필요)
 app.set('trust proxy', true);
 
 const OPENAI_API = 'https://api.openai.com/v1/chat/completions';
 
 // ============================================================
-// 통계 저장소 — Railway 볼륨에 JSON 파일로
+// 글로벌 에러 핸들러 — 어떤 예외도 서버 죽이지 않음
 // ============================================================
-// Railway 볼륨 경로: /data (Railway 대시보드에서 볼륨 마운트 필요)
-// 볼륨 없으면 /tmp에 저장 (재시작 시 사라지지만 동작은 함)
-const DATA_DIR = fs.existsSync('/data') ? '/data' : '/tmp';
+process.on('uncaughtException', (err) => {
+  console.error('[uncaughtException]', err.message);
+});
+process.on('unhandledRejection', (reason) => {
+  console.error('[unhandledRejection]', reason);
+});
+
+// ============================================================
+// 통계 저장소 — 안전하게 초기화
+// ============================================================
+let DATA_DIR = '/tmp';
+try {
+  if (fs.existsSync('/data')) {
+    const testFile = '/data/.write_test';
+    fs.writeFileSync(testFile, 'test');
+    fs.unlinkSync(testFile);
+    DATA_DIR = '/data';
+    console.log('📦 Using /data volume for persistence');
+  } else {
+    console.log('📦 /data volume not mounted, using /tmp (stats will reset on restart)');
+  }
+} catch (e) {
+  console.log('📦 /data not writable, falling back to /tmp:', e.message);
+  DATA_DIR = '/tmp';
+}
+
 const STATS_FILE = path.join(DATA_DIR, 'usage_stats.json');
-const ADMIN_TOKEN = process.env.ADMIN_TOKEN || 'zheila2026'; // 환경변수로 덮어쓰기 권장
+const ADMIN_TOKEN = process.env.ADMIN_TOKEN || 'zheila2026';
 
 function defaultStats() {
   return {
@@ -36,101 +57,120 @@ function defaultStats() {
   };
 }
 
-let stats;
+let stats = defaultStats();
+
 try {
   if (fs.existsSync(STATS_FILE)) {
-    stats = JSON.parse(fs.readFileSync(STATS_FILE, 'utf8'));
-    console.log(`📊 Loaded existing stats from ${STATS_FILE}`);
+    const raw = fs.readFileSync(STATS_FILE, 'utf8');
+    const parsed = JSON.parse(raw);
+    if (parsed && typeof parsed === 'object' && parsed.apps) {
+      stats = parsed;
+      console.log('📊 Loaded ' + Object.keys(stats.apps).length + ' apps from ' + STATS_FILE);
+    }
   } else {
-    stats = defaultStats();
-    console.log(`📊 Created new stats at ${STATS_FILE}`);
+    console.log('📊 No existing stats file — starting fresh');
   }
 } catch (e) {
-  console.error('stats load error:', e);
+  console.error('📊 stats load error (using defaults):', e.message);
   stats = defaultStats();
 }
 
-// 디바운싱 저장 (잦은 쓰기 방지)
 let saveTimer = null;
 function persistStats() {
   if (saveTimer) clearTimeout(saveTimer);
-  saveTimer = setTimeout(() => {
+  saveTimer = setTimeout(function() {
     try {
       stats.lastUpdated = new Date().toISOString();
-      fs.writeFileSync(STATS_FILE, JSON.stringify(stats), 'utf8');
+      fs.writeFileSync(STATS_FILE, JSON.stringify(stats, null, 2), 'utf8');
     } catch (e) {
-      console.error('stats save error:', e);
+      console.error('persistStats error:', e.message);
     }
   }, 1000);
 }
 
-function ensureApp(appId, name) {
-  if (!stats.apps[appId]) {
-    stats.apps[appId] = {
-      name: name || appId,
-      totalVisits: 0,
-      totalGenerates: 0,
-      daily: {},
-      allIps: [],
-    };
-  } else if (name) {
-    stats.apps[appId].name = name;
-  }
-  return stats.apps[appId];
-}
-
-function ensureDaily(app, dateKey) {
-  if (!app.daily[dateKey]) {
-    app.daily[dateKey] = { visits: 0, generates: 0, ips: [] };
-  }
-  return app.daily[dateKey];
-}
-
+// ============================================================
+// 통계 유틸
+// ============================================================
 function getClientIp(req) {
-  const xff = req.headers['x-forwarded-for'];
-  if (xff) return xff.split(',')[0].trim();
-  return req.ip || 'unknown';
+  try {
+    const fwd = req.headers['x-forwarded-for'];
+    if (fwd) return String(fwd).split(',')[0].trim();
+    return req.ip || (req.connection && req.connection.remoteAddress) || 'unknown';
+  } catch (e) {
+    return 'unknown';
+  }
 }
 
 function todayKey() {
   return new Date().toISOString().split('T')[0];
 }
 
+function ensureApp(appId, name) {
+  if (!stats.apps[appId]) {
+    stats.apps[appId] = {
+      id: appId,
+      name: name || appId,
+      totalVisits: 0,
+      totalGenerates: 0,
+      allIps: [],
+      daily: {},
+      firstSeen: new Date().toISOString(),
+    };
+  }
+  if (name) stats.apps[appId].name = name;
+  return stats.apps[appId];
+}
+
+function ensureDaily(appStat, dateKey) {
+  if (!appStat.daily[dateKey]) {
+    appStat.daily[dateKey] = { visits: 0, generates: 0, ips: [] };
+  }
+  return appStat.daily[dateKey];
+}
+
 // ============================================================
 // Health check
 // ============================================================
-app.get('/', (req, res) => {
-  res.json({
-    ok: true,
-    service: 'angry-prompt-server',
-    endpoints: ['/openai/chat', '/openai/scene', '/openai/research', '/track/visit', '/track/generate', '/admin/stats'],
-    features: { vision: true, tracking: true },
-    storage: DATA_DIR,
-    apps_tracked: Object.keys(stats.apps).length,
-  });
+app.get('/', function(req, res) {
+  try {
+    res.json({
+      ok: true,
+      service: 'angry-prompt-server',
+      version: 'v3',
+      endpoints: ['/openai/chat', '/openai/scene', '/openai/research', '/track/visit', '/track/generate', '/admin/stats'],
+      features: { vision: true, tracking: true },
+      storage: DATA_DIR,
+      apps_tracked: Object.keys(stats.apps).length,
+    });
+  } catch (e) {
+    res.json({ ok: true, service: 'angry-prompt-server', version: 'v3' });
+  }
 });
 
 // ============================================================
 // /track/visit
 // ============================================================
-app.post('/track/visit', (req, res) => {
+app.post('/track/visit', function(req, res) {
   try {
-    const { appId, name } = req.body || {};
+    const body = req.body || {};
+    const appId = body.appId;
+    const name = body.name;
     if (!appId) return res.status(400).json({ error: 'appId 필요' });
 
     const ip = getClientIp(req);
     const today = todayKey();
-    const app = ensureApp(appId, name);
-    const day = ensureDaily(app, today);
+    const appStat = ensureApp(appId, name);
+    const day = ensureDaily(appStat, today);
 
-    app.totalVisits += 1;
-    day.visits += 1;
-    if (!day.ips.includes(ip)) day.ips.push(ip);
-    if (!app.allIps.includes(ip)) app.allIps.push(ip);
+    appStat.totalVisits = (appStat.totalVisits || 0) + 1;
+    day.visits = (day.visits || 0) + 1;
+    if (day.ips.indexOf(ip) === -1) day.ips.push(ip);
+    if (appStat.allIps.indexOf(ip) === -1) appStat.allIps.push(ip);
 
     persistStats();
     res.json({ ok: true });
   } catch (e) {
+    console.error('[track/visit]', e.message);
     res.status(500).json({ error: e.message });
   }
 });
@@ -138,143 +178,181 @@ app.post('/track/visit', (req, res) => {
 // ============================================================
 // /track/generate
 // ============================================================
-app.post('/track/generate', (req, res) => {
+app.post('/track/generate', function(req, res) {
   try {
-    const { appId, name } = req.body || {};
+    const body = req.body || {};
+    const appId = body.appId;
+    const name = body.name;
     if (!appId) return res.status(400).json({ error: 'appId 필요' });
 
     const ip = getClientIp(req);
     const today = todayKey();
-    const app = ensureApp(appId, name);
-    const day = ensureDaily(app, today);
+    const appStat = ensureApp(appId, name);
+    const day = ensureDaily(appStat, today);
 
-    app.totalGenerates += 1;
-    day.generates += 1;
-    if (!day.ips.includes(ip)) day.ips.push(ip);
-    if (!app.allIps.includes(ip)) app.allIps.push(ip);
+    appStat.totalGenerates = (appStat.totalGenerates || 0) + 1;
+    day.generates = (day.generates || 0) + 1;
+    if (day.ips.indexOf(ip) === -1) day.ips.push(ip);
+    if (appStat.allIps.indexOf(ip) === -1) appStat.allIps.push(ip);
 
     persistStats();
     res.json({ ok: true });
   } catch (e) {
+    console.error('[track/generate]', e.message);
     res.status(500).json({ error: e.message });
   }
 });
 
 // ============================================================
-// /admin/stats — 통계 조회 (관리자 전용, 토큰 필요)
+// /admin/stats — 통계 조회 (토큰 필요)
 // ============================================================
-app.get('/admin/stats', (req, res) => {
-  const token = req.headers['x-admin-token'] || req.query.token;
-  if (token !== ADMIN_TOKEN) {
-    return res.status(401).json({ error: '인증 실패' });
-  }
-
+app.get('/admin/stats', function(req, res) {
   try {
+    const token = req.headers['x-admin-token'] || req.query.token;
+    if (token !== ADMIN_TOKEN) {
+      return res.status(401).json({ error: '인증 실패' });
+    }
+
     const today = todayKey();
     const yesterday = new Date(Date.now() - 86400000).toISOString().split('T')[0];
 
-    const dateRange = (days) => {
+    function dateRange(days) {
       const arr = [];
       for (let i = 0; i < days; i++) {
         arr.push(new Date(Date.now() - i * 86400000).toISOString().split('T')[0]);
       }
       return arr;
-    };
-
-    const last7days = dateRange(7);
-    const last30days = dateRange(30);
-
-    let grandVisits = 0, grandGenerates = 0;
-    const allIpsGlobal = new Set();
-
-    const apps = Object.entries(stats.apps).map(([appId, a]) => {
-      grandVisits += a.totalVisits;
-      grandGenerates += a.totalGenerates;
-      a.allIps.forEach(ip => allIpsGlobal.add(ip));
-
-      const sumRange = (days) => {
-        let v = 0, g = 0; const ips = new Set();
-        days.forEach(d => {
-          const day = a.daily[d];
-          if (day) { v += day.visits; g += day.generates; day.ips.forEach(ip => ips.add(ip)); }
-        });
-        return { visits: v, generates: g, uniqueVisitors: ips.size };
-      };
-
-      return {
-        appId,
-        name: a.name,
-        totalVisits: a.totalVisits,
-        totalGenerates: a.totalGenerates,
-        uniqueVisitors: a.allIps.length,
-        today: sumRange([today]),
-        yesterday: sumRange([yesterday]),
-        last7: sumRange(last7days),
-        last30: sumRange(last30days),
-      };
-    });
-
-    const dailyChart = [];
-    for (let i = 29; i >= 0; i--) {
-      const d = new Date(Date.now() - i * 86400000).toISOString().split('T')[0];
-      let v = 0, g = 0; const ips = new Set();
-      Object.values(stats.apps).forEach(a => {
-        const day = a.daily[d];
-        if (day) { v += day.visits; g += day.generates; day.ips.forEach(ip => ips.add(ip)); }
-      });
-      dailyChart.push({ date: d, visits: v, generates: g, uniqueVisitors: ips.size });
     }
 
-    res.json({
-      summary: {
-        totalApps: apps.length,
-        totalVisits: grandVisits,
-        totalGenerates: grandGenerates,
-        totalUniqueVisitors: allIpsGlobal.size,
-        lastUpdated: stats.lastUpdated,
-        createdAt: stats.createdAt,
-      },
-      apps,
-      dailyChart,
+    const days7 = dateRange(7);
+    const days30 = dateRange(30);
+
+    let totalVisits = 0;
+    let totalGenerates = 0;
+    const uniqueIpsGlobal = {};
+
+    const appsArr = Object.keys(stats.apps).map(function(appId) {
+      const appStat = stats.apps[appId];
+      totalVisits += appStat.totalVisits || 0;
+      totalGenerates += appStat.totalGenerates || 0;
+      (appStat.allIps || []).forEach(function(ip) { uniqueIpsGlobal[ip] = true; });
+
+      function sumRange(dates) {
+        let v = 0, g = 0;
+        const ips = {};
+        dates.forEach(function(d) {
+          const day = (appStat.daily || {})[d];
+          if (!day) return;
+          v += day.visits || 0;
+          g += day.generates || 0;
+          (day.ips || []).forEach(function(ip) { ips[ip] = true; });
+        });
+        return { visits: v, generates: g, uniqueIps: Object.keys(ips).length };
+      }
+
+      const todayStat = sumRange([today]);
+      const yesterdayStat = sumRange([yesterday]);
+      const week = sumRange(days7);
+      const month = sumRange(days30);
+
+      const trend30 = days30.slice().reverse().map(function(d) {
+        const day = (appStat.daily || {})[d];
+        return {
+          date: d,
+          visits: (day && day.visits) || 0,
+          generates: (day && day.generates) || 0,
+        };
+      });
+
+      return {
+        id: appStat.id,
+        name: appStat.name,
+        totalVisits: appStat.totalVisits || 0,
+        totalGenerates: appStat.totalGenerates || 0,
+        uniqueIps: (appStat.allIps || []).length,
+        today: todayStat,
+        yesterday: yesterdayStat,
+        week: week,
+        month: month,
+        trend30: trend30,
+        firstSeen: appStat.firstSeen,
+      };
     });
+
+    const globalTrend = days30.slice().reverse().map(function(d) {
+      let v = 0, g = 0;
+      Object.keys(stats.apps).forEach(function(appId) {
+        const appStat = stats.apps[appId];
+        const day = (appStat.daily || {})[d];
+        if (!day) return;
+        v += day.visits || 0;
+        g += day.generates || 0;
+      });
+      return { date: d, visits: v, generates: g };
+    });
+
+    res.json({
+      ok: true,
+      summary: {
+        totalVisits: totalVisits,
+        totalGenerates: totalGenerates,
+        totalUniqueIps: Object.keys(uniqueIpsGlobal).length,
+        totalApps: appsArr.length,
+      },
+      apps: appsArr.sort(function(a, b) { return b.totalGenerates - a.totalGenerates; }),
+      globalTrend: globalTrend,
+      storage: DATA_DIR,
+      lastUpdated: stats.lastUpdated,
+    });
+  } catch (e) {
+    console.error('[admin/stats]', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ============================================================
+// /admin/reset
+// ============================================================
+app.post('/admin/reset', function(req, res) {
+  try {
+    const token = req.headers['x-admin-token'] || req.query.token;
+    if (token !== ADMIN_TOKEN) {
+      return res.status(401).json({ error: '인증 실패' });
+    }
+    stats = defaultStats();
+    persistStats();
+    res.json({ ok: true, message: '통계 초기화 완료' });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
 });
 
 // ============================================================
-// /admin/reset — 통계 초기화 (관리자 전용)
+// /openai/chat — Vision 자동 감지
 // ============================================================
-app.post('/admin/reset', (req, res) => {
-  const token = req.headers['x-admin-token'] || req.query.token;
-  if (token !== ADMIN_TOKEN) return res.status(401).json({ error: '인증 실패' });
-  stats = defaultStats();
-  persistStats();
-  res.json({ ok: true });
-});
-
-// ============================================================
-// /openai/chat — vision 지원
-// ============================================================
-app.post('/openai/chat', async (req, res) => {
+app.post('/openai/chat', async function(req, res) {
   try {
-    const {
-      apiKey, system, user, image, vision, model,
-      max_tokens = 900, temperature = 0.8, response_format
-    } = req.body || {};
-
+    const body = req.body || {};
+    const apiKey = body.apiKey;
+    const system = body.system;
+    const user = body.user;
+    const image = body.image;
+    const max_tokens = body.max_tokens;
+    const temperature = body.temperature;
+    const model = body.model;
+    const response_format = body.response_format;
+    
     if (!apiKey) return res.status(400).json({ error: 'apiKey 필요' });
-    if (!system && !user) return res.status(400).json({ error: 'system 또는 user 필요' });
 
-    const isVision = !!(image || vision);
+    const isVision = !!image;
     const useModel = model || (isVision ? 'gpt-4o' : 'gpt-4o-mini');
 
     let userContent;
-    if (isVision && image) {
-      const dataUrl = image.startsWith('data:') ? image : `data:image/jpeg;base64,${image}`;
+    if (isVision) {
+      const imageUrl = image.indexOf('data:') === 0 ? image : ('data:image/jpeg;base64,' + image);
       userContent = [
-        { type: 'text', text: user || 'Analyze this image.' },
-        { type: 'image_url', image_url: { url: dataUrl } }
+        { type: 'text', text: user || '' },
+        { type: 'image_url', image_url: { url: imageUrl } },
       ];
     } else {
       userContent = user || '';
@@ -284,92 +362,149 @@ app.post('/openai/chat', async (req, res) => {
     if (system) messages.push({ role: 'system', content: system });
     messages.push({ role: 'user', content: userContent });
 
-    const payload = { model: useModel, messages, max_tokens, temperature };
+    const payload = { 
+      model: useModel, 
+      messages: messages, 
+      max_tokens: max_tokens || 2000, 
+      temperature: temperature !== undefined ? temperature : 0.9 
+    };
     if (response_format) payload.response_format = response_format;
 
     const openaiRes = await fetch(OPENAI_API, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiKey}` },
+      headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + apiKey },
       body: JSON.stringify(payload)
     });
 
     const data = await openaiRes.json();
     if (!openaiRes.ok) {
-      console.error('[openai/chat] OpenAI error:', data);
-      return res.status(openaiRes.status).json({ error: data.error?.message || 'OpenAI API error', raw: data });
+      const errMsg = (data && data.error && data.error.message) || 'OpenAI API error';
+      console.error('[openai/chat]', errMsg);
+      return res.status(openaiRes.status).json({ error: errMsg });
     }
 
-    const content = data.choices?.[0]?.message?.content || '';
-    return res.json({ content, model: useModel, vision: isVision, usage: data.usage });
+    const content = (data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content) || '';
+    return res.json({ 
+      content: content, 
+      text: content,
+      model: useModel, 
+      vision: isVision, 
+      usage: data.usage 
+    });
   } catch (err) {
-    console.error('[openai/chat] error:', err);
+    console.error('[openai/chat]', err.message);
     return res.status(500).json({ error: err.message });
   }
 });
 
 // ============================================================
-// /openai/scene
+// /openai/scene — 배경 씬 생성
 // ============================================================
-app.post('/openai/scene', async (req, res) => {
+app.post('/openai/scene', async function(req, res) {
   try {
-    const { apiKey, object, concept } = req.body || {};
+    const body = req.body || {};
+    const apiKey = body.apiKey;
+    const object = body.object;
+    const concept = body.concept;
+    const category = body.category;
+    const country = body.country;
+    
     if (!apiKey) return res.status(400).json({ error: 'apiKey 필요' });
     if (!object) return res.status(400).json({ error: 'object 필요' });
 
-    const system = `You are a scene designer for AI short-form video prompts. Given an everyday object and a concept, output a natural setting for this object.
-Return STRICT JSON only:
-{
-  "loc": "<natural location in English>",
-  "props": "<1-3 supporting props in English, comma-separated>",
-  "ambient": "<lighting/mood description in English>",
-  "motion": "<subtle background motion description in English>"
-}`;
-    const user = `Object: ${object}\nConcept: ${concept || 'general'}`;
+    const system = 'You are a scene designer for AI short-form video prompts. Given an everyday object, output a natural setting.\n' +
+      'Return STRICT JSON only:\n' +
+      '{\n' +
+      '  "loc": "<natural location phrase in English>",\n' +
+      '  "props": "<2-3 supporting props in English, comma-separated>",\n' +
+      '  "ambient": "<lighting and mood description in English>",\n' +
+      '  "motion": "<subtle background motion description in English, one sentence>"\n' +
+      '}';
+    const userMsg = 'Object: ' + object + '\nCountry: ' + (country || 'kr') + '\nCategory: ' + (category || concept || 'general');
 
     const openaiRes = await fetch(OPENAI_API, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiKey}` },
+      headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + apiKey },
       body: JSON.stringify({
         model: 'gpt-4o-mini',
-        messages: [{ role: 'system', content: system }, { role: 'user', content: user }],
-        max_tokens: 300, temperature: 0.8,
+        messages: [{ role: 'system', content: system }, { role: 'user', content: userMsg }],
+        max_tokens: 400, 
+        temperature: 0.8,
         response_format: { type: 'json_object' }
       })
     });
 
     const data = await openaiRes.json();
-    if (!openaiRes.ok) return res.status(openaiRes.status).json({ error: data.error?.message || 'OpenAI API error' });
-    const content = data.choices?.[0]?.message?.content || '{}';
+    if (!openaiRes.ok) {
+      const errMsg = (data && data.error && data.error.message) || 'OpenAI API error';
+      return res.status(openaiRes.status).json({ error: errMsg });
+    }
+    const content = (data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content) || '{}';
     let parsed = {};
     try { parsed = JSON.parse(content); } catch(_) {}
     return res.json(parsed);
   } catch (err) {
+    console.error('[openai/scene]', err.message);
     return res.status(500).json({ error: err.message });
   }
 });
 
 // ============================================================
-// /openai/research
+// /openai/research — 정보 수집
 // ============================================================
-app.post('/openai/research', async (req, res) => {
+app.post('/openai/research', async function(req, res) {
   try {
-    const { apiKey, query } = req.body || {};
+    const body = req.body || {};
+    const apiKey = body.apiKey;
+    const object = body.object;
+    const topic = body.topic;
+    const country = body.country;
+    const query = body.query;
+    
     if (!apiKey) return res.status(400).json({ error: 'apiKey 필요' });
 
-    const system = '너는 리서처다. 주제에 대한 사실 기반 정보를 3~5 문장으로 요약해서 한국어로 출력.';
+    const systemJSON = '너는 리서처다. 주어진 사물과 주제에 대해 실제로 유용한 정보를 JSON으로 반환.\n' +
+      '반드시 STRICT JSON만:\n' +
+      '{\n' +
+      '  "reasons": ["<왜 안 좋은가 3-5개>"],\n' +
+      '  "stats": ["<구체적 숫자/사실 2-4개>"],\n' +
+      '  "common_mistakes": ["<사람들이 흔히 하는 실수 2-4개>"],\n' +
+      '  "real_examples": ["<실제 사례 2-4개>"]\n' +
+      '}';
+
+    const userMsg = (object && topic)
+      ? ('사물: ' + object + '\n주제: ' + topic + '\n국가: ' + (country || 'kr') + '\n\n위 사물이 "' + topic + '" 상황에 대해 잔소리할 때 쓸 수 있는 실용 정보. JSON만.')
+      : (query || '일반 정보');
+
     const openaiRes = await fetch(OPENAI_API, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiKey}` },
+      headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + apiKey },
       body: JSON.stringify({
         model: 'gpt-4o-mini',
-        messages: [{ role: 'system', content: system }, { role: 'user', content: query || '' }],
-        max_tokens: 400, temperature: 0.5
+        messages: [{ role: 'system', content: systemJSON }, { role: 'user', content: userMsg }],
+        max_tokens: 600, 
+        temperature: 0.5,
+        response_format: { type: 'json_object' }
       })
     });
     const data = await openaiRes.json();
-    if (!openaiRes.ok) return res.status(openaiRes.status).json({ error: data.error?.message || 'OpenAI API error' });
-    return res.json({ content: data.choices?.[0]?.message?.content || '' });
+    if (!openaiRes.ok) {
+      const errMsg = (data && data.error && data.error.message) || 'OpenAI API error';
+      return res.status(openaiRes.status).json({ error: errMsg });
+    }
+    
+    const content = (data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content) || '{}';
+    let parsed = { reasons: [], stats: [], common_mistakes: [], real_examples: [] };
+    try { 
+      const p = JSON.parse(content);
+      parsed.reasons = p.reasons || [];
+      parsed.stats = p.stats || [];
+      parsed.common_mistakes = p.common_mistakes || [];
+      parsed.real_examples = p.real_examples || [];
+    } catch(_) {}
+    return res.json(parsed);
   } catch (err) {
+    console.error('[openai/research]', err.message);
     return res.status(500).json({ error: err.message });
   }
 });
@@ -378,9 +513,10 @@ app.post('/openai/research', async (req, res) => {
 // Start
 // ============================================================
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`🚀 angry-prompt-server v2 listening on :${PORT}`);
-  console.log(`   · vision enabled (gpt-4o)`);
-  console.log(`   · tracking enabled (storage: ${DATA_DIR})`);
-  console.log(`   · admin token: ${ADMIN_TOKEN === 'zheila2026' ? '⚠️ DEFAULT (env: ADMIN_TOKEN)' : '✅ custom'}`);
+app.listen(PORT, function() {
+  console.log('🚀 angry-prompt-server v3 listening on :' + PORT);
+  console.log('   · storage: ' + DATA_DIR);
+  console.log('   · admin token: ' + (ADMIN_TOKEN === 'zheila2026' ? '⚠️ DEFAULT (set ADMIN_TOKEN env)' : '✅ custom from env'));
+  console.log('   · apps tracked: ' + Object.keys(stats.apps).length);
+  console.log('   · endpoints: /, /openai/chat, /openai/scene, /openai/research, /track/visit, /track/generate, /admin/stats, /admin/reset');
 });
